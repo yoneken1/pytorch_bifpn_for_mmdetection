@@ -22,13 +22,13 @@ class BIFPN(nn.Module):
                  start_level=0,
                  end_level=-1,
                  stack=1,
-                 add_extra_convs=False,
-                 extra_convs_on_inputs=True,
+                 add_extra_convs=True,
+                 extra_convs_on_inputs=False,
                  relu_before_extra_convs=False,
-                 no_norm_on_lateral=False,
+                 no_norm_on_lateral=True,
                  conv_cfg=None,
-                 norm_cfg=None,
-                 activation=None):
+                 norm_cfg=dict(type='BN', requires_grad=False),
+                 activation='relu'):
         super(BIFPN, self).__init__()
         assert isinstance(in_channels, list)
         self.in_channels = in_channels
@@ -60,6 +60,9 @@ class BIFPN(nn.Module):
 
         self.extra_levels = num_outs - self.backbone_end_level + self.start_level
 
+        if self.add_extra_convs:
+            self.extra_convs = nn.ModuleList()
+
         for i in range(self.start_level, self.backbone_end_level):
             l_conv = ConvModule(
                 in_channels[i],
@@ -67,7 +70,7 @@ class BIFPN(nn.Module):
                 1,
                 conv_cfg=conv_cfg,
                 norm_cfg=norm_cfg if not self.no_norm_on_lateral else None,
-                activation=self.activation,
+                activation=None,
                 inplace=False)
             self.lateral_convs.append(l_conv)
 
@@ -80,9 +83,23 @@ class BIFPN(nn.Module):
                     1,
                     conv_cfg=conv_cfg,
                     norm_cfg=norm_cfg if not self.no_norm_on_lateral else None,
-                    activation=self.activation,
+                    activation=None,
                     inplace=False)
                 self.lateral_convs.append(extra_l_conv)
+
+                if self.add_extra_convs:
+                    extra_conv = ConvModule(
+                        in_channels,
+                        in_channels,
+                        3,
+                        stride=2,
+                        padding=1,
+                        conv_cfg=conv_cfg,
+                        norm_cfg=norm_cfg,
+                        activation=self.activation,
+                        inplace=False)
+                    self.extra_convs.append(extra_conv)
+                    
 
         for ii in range(stack):
             self.stack_bifpn_convs.append(BiFPNModule(channels=out_channels,
@@ -90,6 +107,7 @@ class BIFPN(nn.Module):
                                                       conv_cfg=conv_cfg,
                                                       norm_cfg=norm_cfg,
                                                       activation=activation))  
+                                                      
 
 
     def forward(self, inputs):
@@ -101,7 +119,10 @@ class BIFPN(nn.Module):
             # use max pool to get more levels on top of outputs
             # (e.g., Faster R-CNN, Mask R-CNN)
             for i in range(self.extra_levels):
-                inputs.append(F.max_pool2d(inputs[-1], 1, stride=2))
+                if self.add_extra_convs:
+                    inputs.append(self.extra_convs[i](inputs[-1]))
+                else:
+                    inputs.append(F.max_pool2d(inputs[-1], 1, stride=2))
 
         # build laterals
         laterals = [
@@ -147,8 +168,8 @@ class BiFPNModule(nn.Module):
                         padding=1,
                         groups=channels,
                         conv_cfg=conv_cfg,
-                        norm_cfg=norm_cfg,
-                        activation=self.activation,
+                        norm_cfg=None,
+                        activation=None,
                         inplace=False),
                     ConvModule(
                         channels,
@@ -172,26 +193,25 @@ class BiFPNModule(nn.Module):
         # build top-down
         kk=0
         # pathtd = inputs copy is wrong
-        pathtd=[]
-        for in_tensor in inputs:
-            pathtd.append(in_tensor.clone().detach())
+        pathtd=[inputs[levels - 1]]
+#        for in_tensor in inputs:
+#            pathtd.append(in_tensor.clone().detach())
         for i in range(levels - 1, 0, -1):
-            pathtd[i - 1] = w1[0,kk]*pathtd[i - 1] + w1[1,kk]*F.interpolate(
-                pathtd[i], scale_factor=2, mode='nearest')
-#            pathtd[i - 1] = w1[0,kk]*pathtd[i - 1] + w1[1,kk]*F.interpolate(
-#                pathtd[i], size=pathtd[i - 1].size()[-2:], mode='nearest')
-            pathtd[i - 1] = self.bifpn_convs[kk](pathtd[i - 1])
+            _t = w1[0,kk]*inputs[i - 1] + w1[1,kk]*F.interpolate(
+                pathtd[-1], scale_factor=2, mode='nearest')
+            pathtd.append(self.bifpn_convs[kk](_t))
+            del(_t)
             kk=kk+1
         jj=kk
+        pathtd = pathtd[::-1]
         # build down-top
         for i in range(0, levels - 2, 1):
-            pathtd[i + 1] = w2[0, i] * pathtd[i + 1] + w2[1, i] * F.max_pool2d(pathtd[i], kernel_size=2) + w2[2, i] * \
-                            inputs[i + 1]
+            pathtd[i + 1] = w2[0, i] * inputs[i + 1] + w2[1, i] * nn.Upsample(scale_factor=0.5)(pathtd[i]) + w2[2, i] * \
+                            pathtd[i + 1]
             pathtd[i + 1] = self.bifpn_convs[jj](pathtd[i + 1])
             jj=jj+1
 
-        pathtd[levels - 1] = w1[0, kk] * pathtd[levels - 1] + w1[1, kk] * F.max_pool2d(pathtd[levels - 2],
-                                                                                       kernel_size=2)
+        pathtd[levels - 1] = w1[0, kk] * inputs[levels - 1] + w1[1, kk] * nn.Upsample(scale_factor=0.5)(pathtd[levels - 2])
         pathtd[levels - 1] = self.bifpn_convs[jj](pathtd[levels - 1])
         return pathtd
 
